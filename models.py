@@ -3,6 +3,8 @@ import constant
 from func import get_batch,get_trigger_feeddict,f_score,GAC_func,Cudnn_RNN,matmuls
 import numpy as np
 
+from confusion_loss import f1_confusion_loss
+
 class Trigger_Model():
     def __init__(self,t_data,maxlen,wordemb,stage="MOGANED"):
         self.t_train,self.t_dev,self.t_test = t_data
@@ -12,73 +14,8 @@ class Trigger_Model():
         self.build_graph()
     
     def build_graph(self):
-        if self.stage=='DMCNN':
-            print('--Building Trigger DMCNN Graph--')
-            self.build_trigger()
-        else:
-            print('--Building Trigger MOGANED Graph--')
-            self.build_GAT()
-
-    def build_trigger(self,scope='DMCNN_Trigger'):
-        maxlen = self.maxlen
-        num_class = len(constant.EVENT_TYPE_TO_ID)
-        keepprob = constant.t_keepprob
-        with tf.variable_scope(scope,reuse=tf.AUTO_REUSE):
-            with tf.variable_scope('Initialize'):
-                posi_mat = tf.concat(
-                            [tf.zeros([1,constant.posi_embedding_dim],tf.float32),
-                            tf.get_variable('posi_emb',[2*maxlen,constant.posi_embedding_dim],tf.float32,initializer=tf.contrib.layers.xavier_initializer())],axis=0)
-                word_mat = tf.concat([
-                            tf.zeros((1, constant.embedding_dim),dtype=tf.float32),
-                            tf.get_variable("unk_word_embedding", [1, constant.embedding_dim], dtype=tf.float32,initializer=tf.contrib.layers.xavier_initializer()),
-                            tf.get_variable("wordemb", initializer=self.wordemb,trainable=True)], axis=0)
-
-            with tf.variable_scope('placeholder'):
-                self.sents = sents = tf.placeholder(tf.int32,[None,maxlen],'sents')
-                self.posis = posis = tf.placeholder(tf.int32,[None,maxlen],'posis')
-                self.maskls = maskls = tf.placeholder(tf.float32,[None,maxlen],'maskls')
-                self.maskrs = maskrs = tf.placeholder(tf.float32,[None,maxlen],'maskrs')
-                self._labels = _labels = tf.placeholder(tf.int32,[None],'labels')
-                labels = tf.one_hot(_labels,num_class)
-                self.is_train = is_train = tf.placeholder(tf.bool,[],'is_train')
-                self.lexical = lexical = tf.placeholder(tf.int32,[None,3],'lexicals')
-
-                sents_len = tf.reduce_sum(tf.cast(tf.cast(sents,tf.bool),tf.int32),axis=1)
-                sents_mask = tf.expand_dims(tf.sequence_mask(sents_len,maxlen,tf.float32),axis=2)
-            with tf.variable_scope('embedding'):
-                sents_emb = tf.nn.embedding_lookup(word_mat,sents)
-                posis_emb  = tf.nn.embedding_lookup(posi_mat,posis)
-                lexical_emb = tf.nn.embedding_lookup(word_mat,lexical)
-            with tf.variable_scope('lexical_feature'):
-                lexical_feature = tf.reshape(lexical_emb,[-1,3*constant.embedding_dim])
-            with tf.variable_scope('encoder'):
-                emb = tf.concat([sents_emb,posis_emb],axis=2)
-                emb_shape = tf.shape(emb)
-                pad = tf.zeros([emb_shape[0],1,emb_shape[2]],tf.float32)
-                conv_input = tf.concat([pad,emb,pad],axis=1)
-                conv_res = tf.layers.conv1d(
-                        inputs=conv_input,
-                        filters=constant.t_filters, kernel_size=3,
-                        strides=1,
-                        padding='valid',
-                        activation=tf.nn.relu,
-                        kernel_initializer=tf.contrib.layers.xavier_initializer(),
-                        name='convlution_layer')
-                conv_res = tf.reshape(conv_res,[-1,maxlen,constant.t_filters])
-            with tf.variable_scope('maxpooling'):
-                maskl = tf.tile(tf.expand_dims(maskls,axis=2),[1,1,constant.t_filters])
-                left = maskl*conv_res
-                maskr = tf.tile(tf.expand_dims(maskrs,axis=2),[1,1,constant.t_filters])
-                right = maskr*conv_res
-                sentence_feature = tf.concat([tf.reduce_max(left,axis=1),tf.reduce_max(right,axis=1)],axis=1)
-            with tf.variable_scope('classifier'):
-                feature = tf.concat([sentence_feature,lexical_feature],axis=1)
-                feature = tf.layers.dropout(feature,1-constant.t_keepprob,training=is_train)
-                self.logits = logits = tf.layers.dense(feature,num_class,kernel_initializer=tf.contrib.layers.xavier_initializer(),bias_initializer=tf.contrib.layers.xavier_initializer())
-                self.pred = pred = tf.nn.softmax(logits,axis=1)
-                self.pred_label = pred_label = tf.argmax(pred,axis=1)
-                self.loss = loss = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits_v2(labels=labels,logits=logits),axis=0)
-                self.train_op = train_op = tf.train.AdamOptimizer(constant.t_lr).minimize(loss)
+        print('--Building Trigger MOGANED Graph--')
+        self.build_GAT()
 
     def build_GAT(self,scope='MOGANED_Trigger'):
         maxlen = self.maxlen
@@ -116,6 +53,9 @@ class Trigger_Model():
                 self.subg_a =  tf.sparse_placeholder(tf.float32,[None,maxlen,maxlen],'subg')
 
                 self.subg_b =  tf.sparse_transpose(self.subg_a,[0,2,1])
+
+                #新增的变量
+                self.is_negative = tf.placeholder(tf.float32,[None])
 
                 subg_a = tf.sparse_tensor_to_dense(self.subg_a,validate_indices=False)
                 subg_b = tf.sparse_tensor_to_dense(self.subg_b,validate_indices=False)
@@ -161,7 +101,15 @@ class Trigger_Model():
                 self.logits = logits = tf.layers.dense(gather_final_h,num_class,kernel_initializer=tf.contrib.layers.xavier_initializer(),bias_initializer=tf.contrib.layers.xavier_initializer(),name='Wo')
                 self.pred = pred = tf.nn.softmax(logits,axis=1)
                 self.pred_label = pred_label = tf.argmax(pred,axis=1)
-                self.loss = loss = tf.reduce_sum(bias_weight*tf.nn.softmax_cross_entropy_with_logits_v2(labels=labels,logits=logits),axis=0)/tf.reduce_sum(bias_weight,axis=0)
+                #self.loss = loss = tf.reduce_sum(bias_weight*tf.nn.softmax_cross_entropy_with_logits_v2(labels=labels,logits=logits),axis=0)/tf.reduce_sum(bias_weight,axis=0)
+                #新增的变量
+                wrong_confusion_matrix = [[0.0] * num_class] *num_class
+                correct_class_weight = [1.0] * num_class
+                # positive_idx = self.is_negative
+                # negative_idx = 1- self.is_negative
+                positive_idx = 15.0
+                negative_idx = 1-positive_idx 
+                self.loss = loss = tf.reduce_mean(f1_confusion_loss(_labels, logits,positive_idx, negative_idx, correct_class_weight, wrong_confusion_matrix, num_class))
                 self.train_op = train_op = tf.train.AdamOptimizer(constant.t_lr).minimize(loss)
                 
                 
